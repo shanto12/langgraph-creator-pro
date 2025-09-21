@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pytest_cache
+*.DS_Store
+.venv/
+.env
+.env.*
+dist/
+build/
+
+# Creator outputs
+out/
+creator_history.json
