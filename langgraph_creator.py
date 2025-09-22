@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-LangGraph Creator Pro (Enhanced Model Discovery)
-- Multi-provider, real-time model discovery (OpenAI, OpenRouter, Anthropic, Google Gemini, Groq, Mistral, xAI)
-- Capability-aware scoring (reasoning/vision/general) + vendor trust + size/context + price
-- Interactive confirmation/override for selected models
-- Budget-aware: best | balanced | budget
-- Filters out embeddings/audio/TTS/whisper-only models for chat/vision roles
-- Fixes responsibilities rendering in preview
+LangGraph Creator Pro (Robust + Multi-Provider + Iterative Clarifications)
 
-Usage:
-  python langgraph_creator.py "I want to build a research assistant"
+Key improvements:
+- Robust JSON outputs: JSON mode when supported + LLM-based repair + fallback extract
+- Iterative clarifications: ask -> assess completeness -> detect conflicts -> loop
+- Multi-provider live discovery (OpenRouter, OpenAI, Anthropic, Google, Groq, Mistral, xAI)
+- Capability-aware ranking by role (reasoner/vision/general) with vendor trust and cost
+- Interactive model override accepts yes/no/y/n
+- Filters out embeddings/audio/search/tts-only models, avoiding non-chat picks
+
+Usage examples:
+  python langgraph_creator.py "I want to build a SOC incident investigator and actioner, complete to end to end where input would be a json array of incidents"
   python langgraph_creator.py "..." --files "/path/a.pdf,/path/b.csv" --quality best
   python langgraph_creator.py "..." --yes --auto-models
+  python langgraph_creator.py "..." --max-clarify-rounds 4
 """
 
 from __future__ import annotations
@@ -25,12 +28,12 @@ import shutil
 import argparse
 import pathlib
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from rich import print, box
 from rich.console import Console
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.panel import Panel
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -40,7 +43,7 @@ import pandas as pd
 from pypdf import PdfReader
 from pydantic import BaseModel, Field
 
-# Try OpenAI client (also used for OpenRouter/Groq/xAI via base_url)
+# OpenAI client (also used for OpenRouter/Groq/xAI via base_url)
 try:
     from openai import OpenAI
 except Exception:
@@ -65,16 +68,16 @@ class UserSpec(BaseModel):
     file_summaries: List[Dict[str, Any]] = Field(default_factory=list)
 
 class ModelInfo(BaseModel):
-    provider: str             # 'openai' | 'openrouter' | 'anthropic' | 'google' | 'groq' | 'mistral' | 'xai'
-    model_id: str             # ID to call on that provider
-    vendor: Optional[str] = None  # For openrouter (prefix), or derived vendor
+    provider: str              # 'openai' | 'openrouter' | 'anthropic' | 'google' | 'groq' | 'mistral' | 'xai'
+    model_id: str              # ID to call on that provider
+    vendor: Optional[str] = None
     price_prompt: Optional[float] = None
     price_completion: Optional[float] = None
     context: Optional[int] = None
     tags: List[str] = Field(default_factory=list)
 
 class SelectedModels(BaseModel):
-    provider: str             # primary provider for runtime usage in the creator
+    provider: str
     reasoner: str
     general: str
     vision: Optional[str] = None
@@ -97,7 +100,8 @@ class PlanSpec(BaseModel):
 TRUSTED_VENDORS = {
     "openai", "anthropic", "google", "mistral", "meta-llama", "qwen", "groq", "x-ai", "cohere", "perplexity"
 }
-EXCLUDE_KEYWORDS = ["embedding", "embed", "tts", "whisper", "speech", "audio", "asr", "voice"]  # no audio/embeddings for chat/vision
+# Exclude non-chat/specialized models; also filter noisy "search" previews
+EXCLUDE_KEYWORDS = ["embedding", "embed", "tts", "whisper", "speech", "audio", "asr", "voice", "search"]
 
 def slugify(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9\- ]+", "", name).strip().lower().replace(" ", "-")
@@ -163,7 +167,6 @@ def _try_float(x: Any) -> Optional[float]:
 def _vendor_from_id(model_id: str) -> Optional[str]:
     if "/" in model_id:
         return model_id.split("/")[0]
-    # heuristic vendor from name
     lower = model_id.lower()
     for v in TRUSTED_VENDORS:
         if v in lower:
@@ -175,7 +178,7 @@ def _has_excluded_keyword(model_id: str) -> bool:
     return any(k in m for k in EXCLUDE_KEYWORDS)
 
 def _size_score(name: str) -> float:
-    # Heuristic: prefer larger models if known from name e.g., "70b", "405b"
+    # Heuristic: prefer larger models if indicated (e.g., "70b", "405b")
     m = re.search(r"(\d+(?:\.\d+)?)\s*(b|t)\b", name.lower())
     if not m:
         return 0.0
@@ -183,17 +186,14 @@ def _size_score(name: str) -> float:
     unit = m.group(2)
     if unit == "t":
         val *= 1000.0
-    # Normalize to ~0..10
-    return min(10.0, max(0.0, (val / 70.0) * 10.0))  # 70B ~ 10 points, scale
+    return min(10.0, max(0.0, (val / 70.0) * 10.0))
 
 def _context_score(ctx: Optional[int]) -> float:
     if not ctx:
         return 0.0
-    # 32k -> ~5, 200k -> ~10
     return min(10.0, max(0.0, (ctx / 200000.0) * 10.0))
 
 def _price_penalty(model: ModelInfo, quality: str) -> float:
-    # Lower is better; return a penalty to subtract from score.
     if model.price_prompt is None and model.price_completion is None:
         return 0.0
     total = (model.price_prompt or 0.0) + (model.price_completion or 0.0)
@@ -207,16 +207,9 @@ def _vendor_trust_boost(vendor: Optional[str]) -> float:
     if not vendor:
         return 0.0
     weights = {
-        "openai": 6.0,
-        "anthropic": 6.0,
-        "google": 5.5,
-        "mistral": 4.5,
-        "meta-llama": 4.5,
-        "qwen": 4.0,
-        "groq": 4.0,
-        "x-ai": 4.0,
-        "cohere": 3.5,
-        "perplexity": 3.0,
+        "openai": 6.0, "anthropic": 6.0, "google": 5.5, "mistral": 4.5,
+        "meta-llama": 4.5, "qwen": 4.0, "groq": 4.0, "x-ai": 4.0,
+        "cohere": 3.5, "perplexity": 3.0
     }
     return weights.get(vendor, 0.5)
 
@@ -226,30 +219,37 @@ def _capability_boost_reasoner(model_id: str) -> float:
     for kw, val in [
         ("o3", 8.0), ("r1", 8.0), ("reason", 7.0), ("opus", 6.5),
         ("sonnet", 5.0), ("pro", 4.5), ("deepseek", 5.5), ("qwen2.5", 4.5),
-        ("gpt-5", 9.0), ("o4", 7.5),
+        ("gpt-5", 9.0), ("o4", 7.5)
     ]:
-        if kw in n:
-            score += val
+        if kw in n: score += val
     return score + _size_score(n)
 
 def _capability_boost_vision(model_id: str) -> float:
     n = model_id.lower()
     score = 0.0
     for kw, val in [
-        ("vision", 8.0), ("4o", 8.0), ("multimodal", 6.0),
-        ("gemini-1.5", 7.0), ("sonnet", 4.5), ("haiku", 3.5)
+        ("vision", 8.0), ("4o", 8.0), ("multimodal", 6.0), ("gemini-1.5", 7.0),
+        ("sonnet", 4.5), ("haiku", 3.5)
     ]:
-        if kw in n:
-            score += val
-    return score + _context_score(None)
+        if kw in n: score += val
+    # Context unknown -> 0; vision signal mostly from name
+    return score
 
 def _capability_boost_general(model_id: str) -> float:
     n = model_id.lower()
     score = 0.0
     for kw, val in [("mini", 2.0), ("small", 2.0), ("haiku", 3.0), ("sonnet", 4.0), ("pro", 4.0), ("turbo", 3.5)]:
-        if kw in n:
-            score += val
-    return score + _context_score(None) + _size_score(n)
+        if kw in n: score += val
+    return score + _size_score(n)
+
+def confirm_yn(prompt: string, default: bool = False) -> bool:
+    default_label = "Y/n" if default else "y/N"
+    while True:
+        ans = Prompt.ask(f"{prompt} [{default_label}]", default=("y" if default else "n"))
+        a = ans.strip().lower()
+        if a in ("y", "yes"): return True
+        if a in ("n", "no"): return False
+        console.print("Please enter yes or no.")
 
 # --------------------------
 # LLM Router with Multi-Provider Discovery
@@ -269,22 +269,17 @@ class LLMRouter:
         self.mistral_key = os.environ.get("MISTRAL_API_KEY")
         self.google_key = os.environ.get("GOOGLE_API_KEY")
 
-        # Primary provider preference (for chat) — OpenRouter first for breadth
+        # Primary provider for chat/planning — OpenRouter first for breadth
         self.provider = self._choose_primary_provider()
         self.client = self._make_client_for_chat()
 
     def _choose_primary_provider(self) -> str:
-        if self.openrouter_key:
-            return "openrouter"
-        if self.openai_key:
-            return "openai"
-        if self.groq_key:
-            return "groq"
-        if self.xai_key:
-            return "xai"
-        if self.anthropic_key:
-            return "anthropic"
-        raise RuntimeError("No supported provider keys found. Set at least one of: OPENROUTER_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, XAI_API_KEY, or ANTHROPIC_API_KEY.")
+        if self.openrouter_key: return "openrouter"
+        if self.openai_key:     return "openai"
+        if self.groq_key:       return "groq"
+        if self.xai_key:        return "xai"
+        if self.anthropic_key:  return "anthropic"
+        raise RuntimeError("No supported provider keys found. Set one of: OPENROUTER_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, XAI_API_KEY, or ANTHROPIC_API_KEY.")
 
     def _make_client_for_chat(self):
         if self.provider in ("openai", "openrouter", "groq", "xai"):
@@ -298,34 +293,26 @@ class LLMRouter:
                 return OpenAI(api_key=self.groq_key, base_url="https://api.groq.com/openai/v1")
             if self.provider == "xai":
                 return OpenAI(api_key=self.xai_key, base_url="https://api.x.ai/v1")
-        # Anthropics uses a different API; we'll call via requests in chat()
-        return None
+        return None  # Anthropics handled via requests
 
-    # ---- Discovery for each provider ----
+    # ---- Discovery per provider ----
 
     def _discover_openai(self) -> List[ModelInfo]:
-        if not self.openai_key:
-            return []
+        if not self.openai_key or OpenAI is None: return []
         try:
-            client = OpenAI(api_key=self.openai_key) if OpenAI else None
-            if client is None:
-                return []
+            client = OpenAI(api_key=self.openai_key)
             result = client.models.list()
             out = []
             for m in result.data:
                 mid = getattr(m, "id", None) or ""
-                if not mid:
-                    continue
-                if _has_excluded_keyword(mid):
-                    continue
+                if not mid or _has_excluded_keyword(mid): continue
                 out.append(ModelInfo(provider="openai", model_id=mid, vendor="openai"))
             return out
         except Exception:
             return []
 
     def _discover_openrouter(self) -> List[ModelInfo]:
-        if not self.openrouter_key:
-            return []
+        if not self.openrouter_key: return []
         try:
             headers = {"Authorization": f"Bearer {self.openrouter_key}", "Content-Type": "application/json"}
             r = requests.get(f"{self.openrouter_base}/models", headers=headers, timeout=30)
@@ -334,10 +321,7 @@ class LLMRouter:
             out = []
             for m in data.get("data", []):
                 mid = m.get("id")
-                if not mid:
-                    continue
-                if _has_excluded_keyword(mid):
-                    continue
+                if not mid or _has_excluded_keyword(mid): continue
                 pricing = m.get("pricing", {})
                 ctx = m.get("context_length")
                 vendor = _vendor_from_id(mid)
@@ -355,29 +339,23 @@ class LLMRouter:
             return []
 
     def _discover_anthropic(self) -> List[ModelInfo]:
-        if not self.anthropic_key:
-            return []
+        if not self.anthropic_key: return []
         try:
-            headers = {
-                "x-api-key": self.anthropic_key,
-                "anthropic-version": "2023-06-01",
-            }
+            headers = { "x-api-key": self.anthropic_key, "anthropic-version": "2023-06-01" }
             r = requests.get("https://api.anthropic.com/v1/models", headers=headers, timeout=30)
             r.raise_for_status()
             data = r.json()
             out = []
             for m in data.get("data", []):
                 mid = m.get("id")
-                if not mid or _has_excluded_keyword(mid):
-                    continue
+                if not mid or _has_excluded_keyword(mid): continue
                 out.append(ModelInfo(provider="anthropic", model_id=mid, vendor="anthropic"))
             return out
         except Exception:
             return []
 
     def _discover_groq(self) -> List[ModelInfo]:
-        if not self.groq_key:
-            return []
+        if not self.groq_key: return []
         try:
             headers = {"Authorization": f"Bearer {self.groq_key}"}
             r = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=30)
@@ -386,16 +364,14 @@ class LLMRouter:
             out = []
             for m in data.get("data", []):
                 mid = m.get("id") or m.get("name")
-                if not mid or _has_excluded_keyword(mid):
-                    continue
+                if not mid or _has_excluded_keyword(mid): continue
                 out.append(ModelInfo(provider="groq", model_id=mid, vendor="groq"))
             return out
         except Exception:
             return []
 
     def _discover_xai(self) -> List[ModelInfo]:
-        if not self.xai_key:
-            return []
+        if not self.xai_key: return []
         try:
             headers = {"Authorization": f"Bearer {self.xai_key}"}
             r = requests.get("https://api.x.ai/v1/models", headers=headers, timeout=30)
@@ -404,16 +380,14 @@ class LLMRouter:
             out = []
             for m in data.get("data", []):
                 mid = m.get("id") or m.get("name")
-                if not mid or _has_excluded_keyword(mid):
-                    continue
+                if not mid or _has_excluded_keyword(mid): continue
                 out.append(ModelInfo(provider="xai", model_id=mid, vendor="x-ai"))
             return out
         except Exception:
             return []
 
     def _discover_mistral(self) -> List[ModelInfo]:
-        if not self.mistral_key:
-            return []
+        if not self.mistral_key: return []
         try:
             headers = {"Authorization": f"Bearer {self.mistral_key}"}
             r = requests.get("https://api.mistral.ai/v1/models", headers=headers, timeout=30)
@@ -422,16 +396,14 @@ class LLMRouter:
             out = []
             for m in data.get("data", []):
                 mid = m.get("id")
-                if not mid or _has_excluded_keyword(mid):
-                    continue
+                if not mid or _has_excluded_keyword(mid): continue
                 out.append(ModelInfo(provider="mistral", model_id=mid, vendor="mistral"))
             return out
         except Exception:
             return []
 
     def _discover_google(self) -> List[ModelInfo]:
-        if not self.google_key:
-            return []
+        if not self.google_key: return []
         try:
             r = requests.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={self.google_key}", timeout=30)
             r.raise_for_status()
@@ -439,9 +411,7 @@ class LLMRouter:
             out = []
             for m in data.get("models", []):
                 mid = m.get("name")
-                if not mid or _has_excluded_keyword(mid):
-                    continue
-                # Model name is like "models/gemini-1.5-pro-latest"
+                if not mid or _has_excluded_keyword(mid): continue
                 model_name = mid.split("/")[-1]
                 out.append(ModelInfo(provider="google", model_id=model_name, vendor="google"))
             return out
@@ -449,7 +419,6 @@ class LLMRouter:
             return []
 
     def discover_models(self) -> List[ModelInfo]:
-        # Discover from the primary provider first; but also from others (for ranking/info).
         models: List[ModelInfo] = []
         models += self._discover_openrouter()
         models += self._discover_openai()
@@ -459,11 +428,9 @@ class LLMRouter:
         models += self._discover_mistral()
         models += self._discover_google()
 
-        # If primary is openrouter, prefer models that actually exist on openrouter (so we can call them)
         if self.provider == "openrouter":
+            # Keep only models callable via OpenRouter (and trusted vendors if vendor detected)
             models = [m for m in models if m.provider == "openrouter" and (m.vendor in TRUSTED_VENDORS if m.vendor else True)]
-
-        # Filter obviously irrelevant (embeddings/audio already removed)
         return models
 
     # ---- Ranking / selection ----
@@ -474,6 +441,9 @@ class LLMRouter:
             if role == "reasoner":
                 base += _capability_boost_reasoner(m.model_id)
             elif role == "vision":
+                # Penalize previews more
+                if "preview" in m.model_id.lower():
+                    base -= 2.0
                 base += _capability_boost_vision(m.model_id)
             else:
                 base += _capability_boost_general(m.model_id)
@@ -483,20 +453,14 @@ class LLMRouter:
             base -= _price_penalty(m, self.quality)
             return base
 
-        # Extra filter for vision: avoid picking audio-only 4o-audio etc.
-        if role == "vision":
-            filtered = []
-            for m in models:
-                n = m.model_id.lower()
-                if any(k in n for k in ["audio", "tts", "whisper"]):
+        filtered = []
+        for m in models:
+            n = m.model_id.lower()
+            if role == "vision":
+                if any(k in n for k in ["audio", "tts", "whisper", "search"]):
                     continue
-                if not any(k in n for k in ["vision", "4o", "gemini", "multimodal", "sonnet", "haiku"]):
-                    # Keep but lower rank
-                    pass
-                filtered.append(m)
-            models = filtered
-
-        ranked = sorted(models, key=score, reverse=True)
+            filtered.append(m)
+        ranked = sorted(filtered, key=score, reverse=True)
         return ranked
 
     def _pick_top(self, models: List[ModelInfo], role: str) -> Optional[ModelInfo]:
@@ -505,9 +469,8 @@ class LLMRouter:
 
     def pick_models(self, models: List[ModelInfo]) -> SelectedModels:
         if not models:
-            # Fallback defaults per primary
             if self.provider == "openrouter":
-                return SelectedModels(provider="openrouter", reasoner="openai/gpt-4o", general="openai/gpt-4o-mini", vision="openai/gpt-4o")
+                return SelectedModels(provider="openrouter", reasoner="openai/o3-pro", general="openai/gpt-4o-mini", vision="openai/gpt-4o")
             if self.provider == "openai":
                 return SelectedModels(provider="openai", reasoner="gpt-4o", general="gpt-4o-mini", vision="gpt-4o")
             if self.provider == "groq":
@@ -517,10 +480,9 @@ class LLMRouter:
             if self.provider == "anthropic":
                 return SelectedModels(provider="anthropic", reasoner="claude-3-5-sonnet-latest", general="claude-3-haiku-latest", vision="claude-3-5-sonnet-latest")
 
-        # Rank by role
         reasoner_top = self._pick_top(models, "reasoner")
-        general_top = self._pick_top(models, "general")
-        vision_top = self._pick_top(models, "vision")
+        general_top  = self._pick_top(models, "general")
+        vision_top   = self._pick_top(models, "vision")
         return SelectedModels(
             provider=self.provider,
             reasoner=reasoner_top.model_id if reasoner_top else (general_top.model_id if general_top else models[0].model_id),
@@ -528,20 +490,33 @@ class LLMRouter:
             vision=vision_top.model_id if vision_top else None
         )
 
-    # ---- Chat interface ----
+    # ---- Chat interface (with JSON mode support + fallback) ----
 
-    def chat(self, messages: List[Dict[str, Any]], model: str, temperature: float = 0.2, max_tokens: int = 2000) -> str:
+    def chat(self, messages: List[Dict[str, Any]], model: str, temperature: float = 0.2, max_tokens: int = 2000, json_mode: bool = False) -> str:
         try:
             if self.provider in ("openai", "openrouter", "groq", "xai"):
-                resp = self.client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+                if self.client is None:
+                    raise RuntimeError("Client not initialized")
+                params = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                if json_mode:
+                    params["response_format"] = {"type": "json_object"}
+                try:
+                    resp = self.client.chat.completions.create(**params)
+                except Exception:
+                    if json_mode:
+                        # Retry without forced JSON mode if provider/model doesn't support it
+                        params.pop("response_format", None)
+                        resp = self.client.chat.completions.create(**params)
+                    else:
+                        raise
                 return resp.choices[0].message.content or ""
             elif self.provider == "anthropic":
-                # Minimal Anthropics messages call via HTTP
+                # Anthropics via HTTP (no formal JSON mode, so instruct the model)
                 sys_prompt = ""
                 converted_msgs = []
                 for m in messages:
@@ -574,6 +549,34 @@ class LLMRouter:
         except Exception as e:
             raise RuntimeError(f"LLM chat error: {e}") from e
 
+    def chat_json(self, messages: List[Dict[str, Any]], model: str, temperature: float = 0.2, max_tokens: int = 2500) -> Dict[str, Any]:
+        # Try strict JSON mode if supported, else fallback
+        raw = self.chat(messages, model=model, temperature=temperature, max_tokens=max_tokens, json_mode=True)
+        data = try_parse_json(raw)
+        if data is not None:
+            return data
+        # Fallback: try extract codeblock/brace content
+        extracted = extract_json_block(raw)
+        if extracted:
+            data = try_parse_json(extracted)
+            if data is not None:
+                return data
+        # Last chance: repair via LLM
+        repaired = self.repair_json_via_llm(raw, model=model)
+        data = try_parse_json(repaired)
+        if data is not None:
+            return data
+        raise RuntimeError(f"Failed to parse JSON after repair. Raw:\n{raw}")
+
+    def repair_json_via_llm(self, raw: str, model: str) -> str:
+        prompt = [
+            {"role": "system", "content": "You repair invalid JSON into valid, strict JSON that matches the user's intent. Return JSON ONLY, no markdown."},
+            {"role": "user", "content": f"Fix this into valid JSON (do not invent fields, just close strings/arrays/objects and remove comments):\n\n{raw}"}
+        ]
+        fixed = self.chat(prompt, model=model, temperature=0.0, max_tokens=2000, json_mode=True)
+        # If still not valid, return raw to fail upstream
+        return fixed if fixed else raw
+
 # --------------------------
 # Conversational Orchestrator
 # --------------------------
@@ -601,6 +604,23 @@ FOLLOWUP_QUESTION_PROMPT = """You are an AI product manager. Generate up to 5 sh
 Return JSON ONLY as an array of strings.
 """
 
+ASSESS_REQUIREMENTS_PROMPT = """You are an AI analyst. Assess if the current requirements are sufficient to generate a production-ready system.
+Return JSON ONLY with:
+{
+  "satisfied": boolean,
+  "reasons": [string],
+  "followups": [string]   // additional questions to ask if not satisfied
+}
+"""
+
+DETECT_CONFLICTS_PROMPT = """You are an AI reviewer. Detect conflicts or inconsistencies in the user's requirements.
+Return JSON ONLY with:
+{
+  "conflicts": [string],
+  "suggestions": [string] // how to resolve conflicts
+}
+"""
+
 def ask_followups(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> List[str]:
     msgs = [
         {"role": "system", "content": "You generate clarifying questions only as JSON."},
@@ -610,11 +630,12 @@ def ask_followups(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> 
             "instruction": FOLLOWUP_QUESTION_PROMPT
         })}
     ]
-    raw = router.chat(msgs, model=models.general, temperature=0.2, max_tokens=700)
     try:
-        qs = json.loads(raw)
+        qs = router.chat_json(msgs, model=models.general, temperature=0.2, max_tokens=700)
         if isinstance(qs, list):
             return [str(q) for q in qs][:5]
+        if isinstance(qs, dict) and "questions" in qs and isinstance(qs["questions"], list):
+            return [str(q) for q in qs["questions"]][:5]
     except Exception:
         pass
     return [
@@ -625,16 +646,71 @@ def ask_followups(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> 
         "How will success be measured?"
     ]
 
+def assess_requirements(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> Dict[str, Any]:
+    msgs = [
+        {"role": "system", "content": ASSESS_REQUIREMENTS_PROMPT},
+        {"role": "user", "content": json.dumps(spec.model_dump(), indent=2)}
+    ]
+    try:
+        return router.chat_json(msgs, model=models.general, temperature=0.0, max_tokens=600)
+    except Exception:
+        return {"satisfied": True, "reasons": [], "followups": []}
+
+def detect_conflicts(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> Dict[str, Any]:
+    msgs = [
+        {"role": "system", "content": DETECT_CONFLICTS_PROMPT},
+        {"role": "user", "content": json.dumps(spec.model_dump(), indent=2)}
+    ]
+    try:
+        return router.chat_json(msgs, model=models.general, temperature=0.0, max_tokens=700)
+    except Exception:
+        return {"conflicts": [], "suggestions": []}
+
+def clarification_loop(router: LLMRouter, models: SelectedModels, spec: UserSpec, max_rounds: int = 3) -> UserSpec:
+    """Iteratively ask follow-ups until satisfied or until max rounds."""
+    for round_idx in range(max_rounds):
+        questions = ask_followups(router, models, spec)
+        if not questions:
+            break
+        console.print(f"[bold]Clarification round {round_idx+1}[/bold]")
+        for q in questions:
+            ans = Prompt.ask(f"[green]?[/green] {q}", default="")
+            if ans.strip():
+                spec.details[q] = ans.strip()
+
+        # Check conflicts
+        review = detect_conflicts(router, models, spec)
+        conflicts = review.get("conflicts") or []
+        if conflicts:
+            console.print(Panel.fit("\n".join(conflicts), title="Potential Conflicts Detected", style="yellow"))
+            if confirm_yn("Would you like to add clarifications to resolve these?", default=True):
+                for conf in conflicts:
+                    add = Prompt.ask(f"Resolution/clarification for: {conf}", default="")
+                    if add.strip():
+                        # Record under a special key so planner can see resolutions
+                        spec.details.setdefault("conflict_resolutions", []).append({"conflict": conf, "resolution": add.strip()})
+
+        # Assess completeness
+        assessment = assess_requirements(router, models, spec)
+        if bool(assessment.get("satisfied", False)):
+            break
+        followups = assessment.get("followups") or []
+        if not followups:
+            break
+        console.print("[bold]Additional follow-ups needed:[/bold]")
+        for q in followups:
+            ans = Prompt.ask(f"[green]?[/green] {q}", default="")
+            if ans.strip():
+                spec.details[q] = ans.strip()
+    return spec
+
 def generate_plan(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> PlanSpec:
     msgs = [
         {"role": "system", "content": SYSTEM_PLANNER},
         {"role": "user", "content": json.dumps(spec.model_dump(), indent=2)}
     ]
-    raw = router.chat(msgs, model=models.reasoner, temperature=0.2, max_tokens=2500)
-    try:
-        data = json.loads(raw)
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse plan JSON from LLM: {e}\nRaw:\n{raw}") from e
+    # Use strict JSON path + repair
+    data = router.chat_json(msgs, model=models.reasoner, temperature=0.2, max_tokens=3000)
 
     if "project_slug" not in data:
         data["project_slug"] = slugify(data.get("project_name", "project"))
@@ -642,6 +718,12 @@ def generate_plan(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> 
     data.setdefault("agents", [{"name": "Planner", "role": "Planner", "responsibilities": ["Plan the work"]}])
     data.setdefault("state_schema", {"input": "str", "final_answer": "str"})
     data.setdefault("steps", ["plan", "work", "synthesize"])
+
+    # Normalize responsibilities to string list if model returned a single string
+    for a in data.get("agents", []):
+        resp = a.get("responsibilities")
+        if isinstance(resp, str):
+            a["responsibilities"] = [resp]
     return PlanSpec(**data)
 
 # --------------------------
@@ -677,7 +759,7 @@ def analyze_files(file_paths: List[str]) -> List[FileSummary]:
     return results
 
 # --------------------------
-# Generation Templates (unchanged from your version, trimmed for brevity)
+# Generation Templates (project scaffold)
 # --------------------------
 
 TEMPLATE_REQUIREMENTS = """\
@@ -691,7 +773,9 @@ pydantic>=2.9.2
 """
 
 TEMPLATE_ENV_EXAMPLE = """\
+# One of the following is required:
 OPENAI_API_KEY=
+# or
 OPENROUTER_API_KEY=
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 """
@@ -711,13 +795,13 @@ CMD ["python", "src/run.py", "Hello from Docker!"]
 TEMPLATE_MAKEFILE = """\
 .PHONY: setup test run fmt
 setup:
-python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+	python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 test:
-pytest -q
+	pytest -q
 run:
-python src/run.py "Test the app end-to-end"
+	python src/run.py "Test the app end-to-end"
 fmt:
-ruff check --fix || true
+	ruff check --fix || true
 """
 
 TEMPLATE_README = """\
@@ -771,7 +855,6 @@ python src/run.py "Write an outline for the topic: renewable energy trends"
 - Agents are modular; add new ones or tools under `src/agents` and `src/tools`.
 """
 
-# Updated to load model_selection.json and base_url when provider=openrouter
 TEMPLATE_LLM_ROUTER = """\
 import os
 import json
@@ -800,7 +883,6 @@ class LLMRouter:
         self.openrouter_key = os.environ.get("OPENROUTER_API_KEY")
         self.openrouter_base = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
-        # Decide provider: if cfg says openrouter and key exists, use it; else OpenAI
         if provider_from_cfg == "openrouter" and self.openrouter_key:
             self.provider = "openrouter"
         elif self.openai_key:
@@ -818,7 +900,6 @@ class LLMRouter:
         else:
             self.client = OpenAI(api_key=self.openrouter_key, base_url=f"{self.openrouter_base}")
 
-        # Model prefs: config -> args -> fallback
         self.reasoner = preferred_reasoner or cfg.get("reasoner")
         self.general  = preferred_general  or cfg.get("general")
         self.vision   = preferred_vision   or cfg.get("vision")
@@ -1043,7 +1124,6 @@ class ProjectGenerator:
 
         self._write("tests/test_smoke.py", TEMPLATE_TEST_SMOKE)
 
-        # Persist chosen models for the generated app
         model_config = {"provider": self.models.provider, "reasoner": self.models.reasoner, "general": self.models.general, "vision": self.models.vision}
         self._write("model_selection.json", json.dumps(model_config, indent=2))
 
@@ -1054,7 +1134,7 @@ class ProjectGenerator:
             f.write(content)
 
 # --------------------------
-# CLI Flow
+# CLI + Flow
 # --------------------------
 
 def save_history(entry: Dict[str, Any], path: str = "creator_history.json") -> None:
@@ -1104,6 +1184,27 @@ def interactive_model_choice(role: str, ranked: List[ModelInfo], default_model_i
             return top[idx - 1].model_id
     return default_model_id
 
+def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+def extract_json_block(text: str) -> Optional[str]:
+    # Prefer fenced code block ```json ... ```
+    fence = re.findall(r"```json\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        return fence[0]
+    fence_any = re.findall(r"```\s*(.*?)```", text, flags=re.DOTALL)
+    if fence_any:
+        return fence_any[0]
+    # Fallback: first { ... last }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end+1]
+    return None
+
 def main():
     load_dotenv()
     parser = argparse.ArgumentParser(description="LangGraph Creator Pro")
@@ -1113,6 +1214,7 @@ def main():
     parser.add_argument("--yes", action="store_true", help="Non-interactive; skip follow-ups")
     parser.add_argument("--auto-models", action="store_true", help="Skip interactive model choice; accept defaults")
     parser.add_argument("--quality", type=str, choices=["best", "balanced", "budget"], default="balanced", help="Model selection preference")
+    parser.add_argument("--max-clarify-rounds", type=int, default=3, help="Max clarification rounds before planning")
     args = parser.parse_args()
 
     console.print(Panel.fit("[bold cyan]LangGraph Creator Pro[/bold cyan]\nBuild intelligent multi-agent systems with zero code.", box=box.ROUNDED))
@@ -1147,9 +1249,9 @@ def main():
     table.add_row("Vision", selected.vision or "-", selected.provider)
     console.print(table)
 
-    # Interactive choice if not auto
+    # Interactive override
     if not args.auto_models:
-        if Confirm.ask("Would you like to choose different models?", default=False):
+        if confirm_yn("Would you like to choose different models?", default=False):
             selected.reasoner = interactive_model_choice("reasoner", reasoner_ranked, selected.reasoner)
             selected.general  = interactive_model_choice("general", general_ranked, selected.general)
             if vision_ranked:
@@ -1176,16 +1278,10 @@ def main():
     # Compose spec
     spec = UserSpec(goal=args.goal, file_summaries=[fs.__dict__ for fs in file_summaries])
 
-    # Follow-ups
+    # Clarifications loop (unless --yes)
     if not args.yes:
         console.print("[bold]A few quick questions to tailor the system...[/bold]")
-        questions = ask_followups(router, selected, spec)
-        answers: Dict[str, Any] = {}
-        for q in questions:
-            ans = Prompt.ask(f"[green]?[/green] {q}", default="")
-            if ans.strip():
-                answers[q] = ans.strip()
-        spec.details = answers
+        spec = clarification_loop(router, selected, spec, max_rounds=args.max_clarify_rounds)
 
     # Generate plan
     console.print("[bold]Designing your multi-agent architecture...[/bold]")
@@ -1193,7 +1289,7 @@ def main():
         progress.add_task("Reasoning and planning", total=None)
         plan = generate_plan(router, selected, spec)
 
-    # Preview (with fixed responsibilities rendering)
+    # Preview
     console.print(Panel.fit(f"[bold]Project:[/bold] {plan.project_name}\n[bold]Slug:[/bold] {plan.project_slug}\n[bold]Description:[/bold] {plan.description}", title="Plan Preview"))
 
     at = Table(title="Agents", box=box.SIMPLE)
@@ -1220,7 +1316,7 @@ def main():
     console.print(steps_table)
 
     if not args.yes:
-        if not Confirm.ask("Proceed to generate the project now?", default=True):
+        if not confirm_yn("Proceed to generate the project now?", default=True):
             console.print("[yellow]Cancelled.[/yellow]")
             sys.exit(0)
 
@@ -1237,7 +1333,6 @@ def main():
     console.print("[green]✅ Project generated successfully.[/green]")
     console.print(f"Next steps:\n  1) cd {os.path.join(out_dir, plan.project_slug)}\n  2) python -m venv .venv && source .venv/bin/activate\n  3) pip install -r requirements.txt\n  4) cp .env.example .env  # add your API keys\n  5) python src/run.py \"Your prompt here\"")
 
-    # Save history (self-improving)
     save_history({
         "ts": time.time(),
         "goal": args.goal,
