@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-LangGraph Creator Pro
-- Single-file, conversational generator for production-ready LangGraph multi-agent systems.
-- Discovers available models using your API keys (OpenAI / OpenRouter).
-- Analyzes files (PDF, CSV, JSON, text) and integrates insights into the design.
-- Outputs a complete project with Dockerfile, tests, docs, and a runnable graph.
+LangGraph Creator Pro (Enhanced Model Discovery)
+- Multi-provider, real-time model discovery (OpenAI, OpenRouter, Anthropic, Google Gemini, Groq, Mistral, xAI)
+- Capability-aware scoring (reasoning/vision/general) + vendor trust + size/context + price
+- Interactive confirmation/override for selected models
+- Budget-aware: best | balanced | budget
+- Filters out embeddings/audio/TTS/whisper-only models for chat/vision roles
+- Fixes responsibilities rendering in preview
 
 Usage:
-  python langgraph_creator.py "I want to build a research assistant" --files "/path/a.pdf,/path/b.csv"
+  python langgraph_creator.py "I want to build a research assistant"
+  python langgraph_creator.py "..." --files "/path/a.pdf,/path/b.csv" --quality best
+  python langgraph_creator.py "..." --yes --auto-models
 """
 
 from __future__ import annotations
@@ -17,13 +21,11 @@ import re
 import sys
 import json
 import time
-import base64
 import shutil
-import textwrap
 import argparse
 import pathlib
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from rich import print, box
@@ -31,23 +33,20 @@ from rich.console import Console
 from rich.prompt import Confirm, Prompt
 from rich.panel import Panel
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-from rich.tree import Tree
-import requests
+from rich.progress import Progress, SpinnerColumn, TextColumn
 from jinja2 import Template
+import requests
 import pandas as pd
 from pypdf import PdfReader
 from pydantic import BaseModel, Field
-from ruamel.yaml import YAML
 
-# Try to import OpenAI client
+# Try OpenAI client (also used for OpenRouter/Groq/xAI via base_url)
 try:
     from openai import OpenAI
-except Exception:  # pragma: no cover
+except Exception:
     OpenAI = None  # type: ignore
 
 console = Console()
-yaml = YAML()
 
 # --------------------------
 # Data Models
@@ -60,28 +59,25 @@ class FileSummary:
     bytes: int
     summary: str
 
-
 class UserSpec(BaseModel):
-    goal: str = Field(..., description="User high-level request/intent.")
-    details: Dict[str, Any] = Field(default_factory=dict, description="Answers to clarifying questions.")
+    goal: str
+    details: Dict[str, Any] = Field(default_factory=dict)
     file_summaries: List[Dict[str, Any]] = Field(default_factory=list)
 
-
 class ModelInfo(BaseModel):
-    provider: str
-    model_id: str
+    provider: str             # 'openai' | 'openrouter' | 'anthropic' | 'google' | 'groq' | 'mistral' | 'xai'
+    model_id: str             # ID to call on that provider
+    vendor: Optional[str] = None  # For openrouter (prefix), or derived vendor
     price_prompt: Optional[float] = None
     price_completion: Optional[float] = None
     context: Optional[int] = None
     tags: List[str] = Field(default_factory=list)
 
-
 class SelectedModels(BaseModel):
+    provider: str             # primary provider for runtime usage in the creator
     reasoner: str
     general: str
     vision: Optional[str] = None
-    provider: str = "openai_or_openrouter"
-
 
 class PlanSpec(BaseModel):
     project_name: str
@@ -94,31 +90,30 @@ class PlanSpec(BaseModel):
     tasks_by_agent: Dict[str, List[str]] = Field(default_factory=dict)
     notes: Optional[str] = None
 
-
 # --------------------------
 # Helpers
 # --------------------------
+
+TRUSTED_VENDORS = {
+    "openai", "anthropic", "google", "mistral", "meta-llama", "qwen", "groq", "x-ai", "cohere", "perplexity"
+}
+EXCLUDE_KEYWORDS = ["embedding", "embed", "tts", "whisper", "speech", "audio", "asr", "voice"]  # no audio/embeddings for chat/vision
 
 def slugify(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9\- ]+", "", name).strip().lower().replace(" ", "-")
     s = re.sub(r"-{2,}", "-", s)
     return s or "project"
 
-
 def ensure_dir(p: str | pathlib.Path) -> None:
     pathlib.Path(p).mkdir(parents=True, exist_ok=True)
-
 
 def read_text_file(path: str, limit: int = 20000) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
-            if len(content) > limit:
-                return content[:limit] + "\n...[truncated]..."
-            return content
+            return content if len(content) <= limit else content[:limit] + "\n...[truncated]..."
     except Exception as e:
         return f"[Error reading text file: {e}]"
-
 
 def summarize_pdf(path: str, limit_pages: int = 10, char_limit: int = 20000) -> str:
     try:
@@ -128,12 +123,9 @@ def summarize_pdf(path: str, limit_pages: int = 10, char_limit: int = 20000) -> 
             txt = page.extract_text() or ""
             texts.append(f"[Page {i+1}]\n{txt}")
         content = "\n\n".join(texts)
-        if len(content) > char_limit:
-            content = content[:char_limit] + "\n...[truncated]..."
-        return content
+        return content if len(content) <= char_limit else content[:char_limit] + "\n...[truncated]..."
     except Exception as e:
         return f"[Error reading PDF: {e}]"
-
 
 def summarize_csv(path: str, rows: int = 10) -> str:
     try:
@@ -144,7 +136,6 @@ def summarize_csv(path: str, rows: int = 10) -> str:
     except Exception as e:
         return f"[Error reading CSV: {e}]"
 
-
 def summarize_xlsx(path: str, rows: int = 10) -> str:
     try:
         df = pd.read_excel(path)
@@ -154,170 +145,14 @@ def summarize_xlsx(path: str, rows: int = 10) -> str:
     except Exception as e:
         return f"[Error reading XLSX: {e}]"
 
-
 def summarize_json(path: str, char_limit: int = 20000) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             data = json.load(f)
         pretty = json.dumps(data, indent=2)
-        if len(pretty) > char_limit:
-            pretty = pretty[:char_limit] + "\n...[truncated]..."
-        return f"JSON Structure:\n{pretty}"
+        return pretty if len(pretty) <= char_limit else pretty[:char_limit] + "\n...[truncated]..."
     except Exception as e:
         return f"[Error reading JSON: {e}]"
-
-
-# --------------------------
-# LLM Router & Model Discovery
-# --------------------------
-
-class LLMRouter:
-    """
-    Supports OpenAI or OpenRouter automatically.
-    - Discovers models via provider listing.
-    - Provides a simple chat() interface for prompts.
-    """
-    def __init__(self) -> None:
-        self.openai_key = os.environ.get("OPENAI_API_KEY")
-        self.openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-        self.openrouter_base = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        self.provider = self._detect_provider()
-
-        self.client = None
-        if self.provider == "openai":
-            if OpenAI is None:
-                raise RuntimeError("openai package is required. Please install requirements.txt")
-            self.client = OpenAI(api_key=self.openai_key)
-        elif self.provider == "openrouter":
-            # Use OpenAI client with different base_url for OpenRouter (OpenAI-compatible)
-            if OpenAI is None:
-                raise RuntimeError("openai package is required. Please install requirements.txt")
-            self.client = OpenAI(api_key=self.openrouter_key, base_url=f"{self.openrouter_base}")
-        else:
-            raise RuntimeError("No supported provider keys found. Set OPENAI_API_KEY or OPENROUTER_API_KEY.")
-
-    def _detect_provider(self) -> str:
-        if self.openrouter_key:
-            return "openrouter"
-        if self.openai_key:
-            return "openai"
-        return "none"
-
-    def discover_models(self) -> List[ModelInfo]:
-        if self.provider == "openai":
-            try:
-                result = self.client.models.list()
-                models = []
-                # We do not get pricing from OpenAI listing; capture ids
-                for m in result.data:
-                    mid = getattr(m, "id", None) or getattr(m, "model", None) or ""
-                    if mid:
-                        tags = []
-                        if "o3" in mid or "reasoning" in mid:
-                            tags.append("reasoning")
-                        if "gpt-4o" in mid or "4o" in mid:
-                            tags.append("vision")
-                        models.append(ModelInfo(provider="openai", model_id=mid, tags=tags))
-                return models
-            except Exception as e:
-                console.print(f"[yellow]OpenAI model discovery failed: {e}[/yellow]")
-                return []
-        elif self.provider == "openrouter":
-            try:
-                headers = {
-                    "Authorization": f"Bearer {self.openrouter_key}",
-                    "Content-Type": "application/json"
-                }
-                resp = requests.get(f"{self.openrouter_base}/models", headers=headers, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-                models = []
-                for m in data.get("data", []):
-                    mid = m.get("id")
-                    pricing = m.get("pricing", {})
-                    ctx = m.get("context_length")
-                    tags = m.get("tags") or []
-                    models.append(ModelInfo(
-                        provider="openrouter",
-                        model_id=mid,
-                        price_prompt=_try_float(pricing.get("prompt")) if pricing else None,
-                        price_completion=_try_float(pricing.get("completion")) if pricing else None,
-                        context=ctx,
-                        tags=tags
-                    ))
-                return models
-            except Exception as e:
-                console.print(f"[yellow]OpenRouter model discovery failed: {e}[/yellow]")
-                return []
-        return []
-
-    def pick_models(self, models: List[ModelInfo]) -> SelectedModels:
-        """
-        Heuristic:
-        - Reasoner: prefer models tagged 'reasoning' or names containing 'o3', 'r1', 'opus', 'deepthink', etc.
-        - Vision: prefer models tagged 'vision' or names containing '4o', 'vision'
-        - General: cheapest with good context, fallback to 'gpt-4o-mini'/'gpt-4o' style
-        """
-        if not models:
-            # conservative defaults likely to exist
-            if self.provider == "openai":
-                return SelectedModels(reasoner="gpt-4o", general="gpt-4o-mini", vision="gpt-4o", provider="openai")
-            else:
-                return SelectedModels(reasoner="openrouter/auto", general="openrouter/auto", vision=None, provider="openrouter")
-
-        def score_reasoner(m: ModelInfo) -> int:
-            name = m.model_id.lower()
-            score = 0
-            if "reason" in name or "o3" in name or "r1" in name or "opus" in name or "deepseek" in name:
-                score += 10
-            if "4o" in name:
-                score += 2
-            return score
-
-        def score_vision(m: ModelInfo) -> int:
-            name = m.model_id.lower()
-            score = 0
-            if "vision" in name or "4o" in name:
-                score += 10
-            if "image" in name:
-                score += 5
-            return score
-
-        def score_general(m: ModelInfo) -> float:
-            # Prefer lower price if available
-            price = (m.price_prompt or 0.0) + (m.price_completion or 0.0)
-            if price > 0:
-                return 1.0 / price
-            # fallback preference for known names
-            name = m.model_id.lower()
-            if "mini" in name or "small" in name:
-                return 2.0
-            if "4o" in name or "sonnet" in name or "haiku" in name:
-                return 1.5
-            return 1.0
-
-        reasoner = max(models, key=score_reasoner).model_id
-        vision_cands = [m for m in models if score_vision(m) > 0]
-        vision = max(vision_cands, key=score_vision).model_id if vision_cands else None
-        general = max(models, key=score_general).model_id
-
-        return SelectedModels(reasoner=reasoner, general=general, vision=vision, provider=self.provider)
-
-    def chat(self, messages: List[Dict[str, Any]], model: str, temperature: float = 0.2, max_tokens: int = 2000) -> str:
-        """
-        Uses OpenAI-compatible Chat Completions endpoint through openai client.
-        """
-        try:
-            resp = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return resp.choices[0].message.content or ""
-        except Exception as e:
-            raise RuntimeError(f"LLM chat error: {e}") from e
-
 
 def _try_float(x: Any) -> Optional[float]:
     try:
@@ -325,6 +160,419 @@ def _try_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+def _vendor_from_id(model_id: str) -> Optional[str]:
+    if "/" in model_id:
+        return model_id.split("/")[0]
+    # heuristic vendor from name
+    lower = model_id.lower()
+    for v in TRUSTED_VENDORS:
+        if v in lower:
+            return v
+    return None
+
+def _has_excluded_keyword(model_id: str) -> bool:
+    m = model_id.lower()
+    return any(k in m for k in EXCLUDE_KEYWORDS)
+
+def _size_score(name: str) -> float:
+    # Heuristic: prefer larger models if known from name e.g., "70b", "405b"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(b|t)\b", name.lower())
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    unit = m.group(2)
+    if unit == "t":
+        val *= 1000.0
+    # Normalize to ~0..10
+    return min(10.0, max(0.0, (val / 70.0) * 10.0))  # 70B ~ 10 points, scale
+
+def _context_score(ctx: Optional[int]) -> float:
+    if not ctx:
+        return 0.0
+    # 32k -> ~5, 200k -> ~10
+    return min(10.0, max(0.0, (ctx / 200000.0) * 10.0))
+
+def _price_penalty(model: ModelInfo, quality: str) -> float:
+    # Lower is better; return a penalty to subtract from score.
+    if model.price_prompt is None and model.price_completion is None:
+        return 0.0
+    total = (model.price_prompt or 0.0) + (model.price_completion or 0.0)
+    if quality == "budget":
+        return total * 4.0
+    if quality == "balanced":
+        return total * 2.0
+    return total * 1.0  # 'best'
+
+def _vendor_trust_boost(vendor: Optional[str]) -> float:
+    if not vendor:
+        return 0.0
+    weights = {
+        "openai": 6.0,
+        "anthropic": 6.0,
+        "google": 5.5,
+        "mistral": 4.5,
+        "meta-llama": 4.5,
+        "qwen": 4.0,
+        "groq": 4.0,
+        "x-ai": 4.0,
+        "cohere": 3.5,
+        "perplexity": 3.0,
+    }
+    return weights.get(vendor, 0.5)
+
+def _capability_boost_reasoner(model_id: str) -> float:
+    n = model_id.lower()
+    score = 0.0
+    for kw, val in [
+        ("o3", 8.0), ("r1", 8.0), ("reason", 7.0), ("opus", 6.5),
+        ("sonnet", 5.0), ("pro", 4.5), ("deepseek", 5.5), ("qwen2.5", 4.5),
+        ("gpt-5", 9.0), ("o4", 7.5),
+    ]:
+        if kw in n:
+            score += val
+    return score + _size_score(n)
+
+def _capability_boost_vision(model_id: str) -> float:
+    n = model_id.lower()
+    score = 0.0
+    for kw, val in [
+        ("vision", 8.0), ("4o", 8.0), ("multimodal", 6.0),
+        ("gemini-1.5", 7.0), ("sonnet", 4.5), ("haiku", 3.5)
+    ]:
+        if kw in n:
+            score += val
+    return score + _context_score(None)
+
+def _capability_boost_general(model_id: str) -> float:
+    n = model_id.lower()
+    score = 0.0
+    for kw, val in [("mini", 2.0), ("small", 2.0), ("haiku", 3.0), ("sonnet", 4.0), ("pro", 4.0), ("turbo", 3.5)]:
+        if kw in n:
+            score += val
+    return score + _context_score(None) + _size_score(n)
+
+# --------------------------
+# LLM Router with Multi-Provider Discovery
+# --------------------------
+
+class LLMRouter:
+    def __init__(self, quality: str = "balanced") -> None:
+        self.quality = quality  # 'best' | 'balanced' | 'budget'
+
+        # Keys
+        self.openai_key = os.environ.get("OPENAI_API_KEY")
+        self.openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+        self.openrouter_base = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        self.anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+        self.groq_key = os.environ.get("GROQ_API_KEY")
+        self.xai_key = os.environ.get("XAI_API_KEY")
+        self.mistral_key = os.environ.get("MISTRAL_API_KEY")
+        self.google_key = os.environ.get("GOOGLE_API_KEY")
+
+        # Primary provider preference (for chat) — OpenRouter first for breadth
+        self.provider = self._choose_primary_provider()
+        self.client = self._make_client_for_chat()
+
+    def _choose_primary_provider(self) -> str:
+        if self.openrouter_key:
+            return "openrouter"
+        if self.openai_key:
+            return "openai"
+        if self.groq_key:
+            return "groq"
+        if self.xai_key:
+            return "xai"
+        if self.anthropic_key:
+            return "anthropic"
+        raise RuntimeError("No supported provider keys found. Set at least one of: OPENROUTER_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, XAI_API_KEY, or ANTHROPIC_API_KEY.")
+
+    def _make_client_for_chat(self):
+        if self.provider in ("openai", "openrouter", "groq", "xai"):
+            if OpenAI is None:
+                raise RuntimeError("openai package is required. pip install -r requirements.txt")
+            if self.provider == "openai":
+                return OpenAI(api_key=self.openai_key)
+            if self.provider == "openrouter":
+                return OpenAI(api_key=self.openrouter_key, base_url=self.openrouter_base)
+            if self.provider == "groq":
+                return OpenAI(api_key=self.groq_key, base_url="https://api.groq.com/openai/v1")
+            if self.provider == "xai":
+                return OpenAI(api_key=self.xai_key, base_url="https://api.x.ai/v1")
+        # Anthropics uses a different API; we'll call via requests in chat()
+        return None
+
+    # ---- Discovery for each provider ----
+
+    def _discover_openai(self) -> List[ModelInfo]:
+        if not self.openai_key:
+            return []
+        try:
+            client = OpenAI(api_key=self.openai_key) if OpenAI else None
+            if client is None:
+                return []
+            result = client.models.list()
+            out = []
+            for m in result.data:
+                mid = getattr(m, "id", None) or ""
+                if not mid:
+                    continue
+                if _has_excluded_keyword(mid):
+                    continue
+                out.append(ModelInfo(provider="openai", model_id=mid, vendor="openai"))
+            return out
+        except Exception:
+            return []
+
+    def _discover_openrouter(self) -> List[ModelInfo]:
+        if not self.openrouter_key:
+            return []
+        try:
+            headers = {"Authorization": f"Bearer {self.openrouter_key}", "Content-Type": "application/json"}
+            r = requests.get(f"{self.openrouter_base}/models", headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for m in data.get("data", []):
+                mid = m.get("id")
+                if not mid:
+                    continue
+                if _has_excluded_keyword(mid):
+                    continue
+                pricing = m.get("pricing", {})
+                ctx = m.get("context_length")
+                vendor = _vendor_from_id(mid)
+                out.append(ModelInfo(
+                    provider="openrouter",
+                    model_id=mid,
+                    vendor=vendor,
+                    price_prompt=_try_float(pricing.get("prompt")) if pricing else None,
+                    price_completion=_try_float(pricing.get("completion")) if pricing else None,
+                    context=ctx,
+                    tags=m.get("tags") or []
+                ))
+            return out
+        except Exception:
+            return []
+
+    def _discover_anthropic(self) -> List[ModelInfo]:
+        if not self.anthropic_key:
+            return []
+        try:
+            headers = {
+                "x-api-key": self.anthropic_key,
+                "anthropic-version": "2023-06-01",
+            }
+            r = requests.get("https://api.anthropic.com/v1/models", headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for m in data.get("data", []):
+                mid = m.get("id")
+                if not mid or _has_excluded_keyword(mid):
+                    continue
+                out.append(ModelInfo(provider="anthropic", model_id=mid, vendor="anthropic"))
+            return out
+        except Exception:
+            return []
+
+    def _discover_groq(self) -> List[ModelInfo]:
+        if not self.groq_key:
+            return []
+        try:
+            headers = {"Authorization": f"Bearer {self.groq_key}"}
+            r = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for m in data.get("data", []):
+                mid = m.get("id") or m.get("name")
+                if not mid or _has_excluded_keyword(mid):
+                    continue
+                out.append(ModelInfo(provider="groq", model_id=mid, vendor="groq"))
+            return out
+        except Exception:
+            return []
+
+    def _discover_xai(self) -> List[ModelInfo]:
+        if not self.xai_key:
+            return []
+        try:
+            headers = {"Authorization": f"Bearer {self.xai_key}"}
+            r = requests.get("https://api.x.ai/v1/models", headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for m in data.get("data", []):
+                mid = m.get("id") or m.get("name")
+                if not mid or _has_excluded_keyword(mid):
+                    continue
+                out.append(ModelInfo(provider="xai", model_id=mid, vendor="x-ai"))
+            return out
+        except Exception:
+            return []
+
+    def _discover_mistral(self) -> List[ModelInfo]:
+        if not self.mistral_key:
+            return []
+        try:
+            headers = {"Authorization": f"Bearer {self.mistral_key}"}
+            r = requests.get("https://api.mistral.ai/v1/models", headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for m in data.get("data", []):
+                mid = m.get("id")
+                if not mid or _has_excluded_keyword(mid):
+                    continue
+                out.append(ModelInfo(provider="mistral", model_id=mid, vendor="mistral"))
+            return out
+        except Exception:
+            return []
+
+    def _discover_google(self) -> List[ModelInfo]:
+        if not self.google_key:
+            return []
+        try:
+            r = requests.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={self.google_key}", timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for m in data.get("models", []):
+                mid = m.get("name")
+                if not mid or _has_excluded_keyword(mid):
+                    continue
+                # Model name is like "models/gemini-1.5-pro-latest"
+                model_name = mid.split("/")[-1]
+                out.append(ModelInfo(provider="google", model_id=model_name, vendor="google"))
+            return out
+        except Exception:
+            return []
+
+    def discover_models(self) -> List[ModelInfo]:
+        # Discover from the primary provider first; but also from others (for ranking/info).
+        models: List[ModelInfo] = []
+        models += self._discover_openrouter()
+        models += self._discover_openai()
+        models += self._discover_anthropic()
+        models += self._discover_groq()
+        models += self._discover_xai()
+        models += self._discover_mistral()
+        models += self._discover_google()
+
+        # If primary is openrouter, prefer models that actually exist on openrouter (so we can call them)
+        if self.provider == "openrouter":
+            models = [m for m in models if m.provider == "openrouter" and (m.vendor in TRUSTED_VENDORS if m.vendor else True)]
+
+        # Filter obviously irrelevant (embeddings/audio already removed)
+        return models
+
+    # ---- Ranking / selection ----
+
+    def _rank_for_role(self, models: List[ModelInfo], role: str) -> List[ModelInfo]:
+        def score(m: ModelInfo) -> float:
+            base = 0.0
+            if role == "reasoner":
+                base += _capability_boost_reasoner(m.model_id)
+            elif role == "vision":
+                base += _capability_boost_vision(m.model_id)
+            else:
+                base += _capability_boost_general(m.model_id)
+
+            base += _vendor_trust_boost(m.vendor or _vendor_from_id(m.model_id))
+            base += _context_score(m.context)
+            base -= _price_penalty(m, self.quality)
+            return base
+
+        # Extra filter for vision: avoid picking audio-only 4o-audio etc.
+        if role == "vision":
+            filtered = []
+            for m in models:
+                n = m.model_id.lower()
+                if any(k in n for k in ["audio", "tts", "whisper"]):
+                    continue
+                if not any(k in n for k in ["vision", "4o", "gemini", "multimodal", "sonnet", "haiku"]):
+                    # Keep but lower rank
+                    pass
+                filtered.append(m)
+            models = filtered
+
+        ranked = sorted(models, key=score, reverse=True)
+        return ranked
+
+    def _pick_top(self, models: List[ModelInfo], role: str) -> Optional[ModelInfo]:
+        ranked = self._rank_for_role(models, role)
+        return ranked[0] if ranked else None
+
+    def pick_models(self, models: List[ModelInfo]) -> SelectedModels:
+        if not models:
+            # Fallback defaults per primary
+            if self.provider == "openrouter":
+                return SelectedModels(provider="openrouter", reasoner="openai/gpt-4o", general="openai/gpt-4o-mini", vision="openai/gpt-4o")
+            if self.provider == "openai":
+                return SelectedModels(provider="openai", reasoner="gpt-4o", general="gpt-4o-mini", vision="gpt-4o")
+            if self.provider == "groq":
+                return SelectedModels(provider="groq", reasoner="llama-3.1-70b-versatile", general="llama-3.1-8b-instant", vision=None)
+            if self.provider == "xai":
+                return SelectedModels(provider="xai", reasoner="grok-2-latest", general="grok-2-mini", vision=None)
+            if self.provider == "anthropic":
+                return SelectedModels(provider="anthropic", reasoner="claude-3-5-sonnet-latest", general="claude-3-haiku-latest", vision="claude-3-5-sonnet-latest")
+
+        # Rank by role
+        reasoner_top = self._pick_top(models, "reasoner")
+        general_top = self._pick_top(models, "general")
+        vision_top = self._pick_top(models, "vision")
+        return SelectedModels(
+            provider=self.provider,
+            reasoner=reasoner_top.model_id if reasoner_top else (general_top.model_id if general_top else models[0].model_id),
+            general=general_top.model_id if general_top else (reasoner_top.model_id if reasoner_top else models[0].model_id),
+            vision=vision_top.model_id if vision_top else None
+        )
+
+    # ---- Chat interface ----
+
+    def chat(self, messages: List[Dict[str, Any]], model: str, temperature: float = 0.2, max_tokens: int = 2000) -> str:
+        try:
+            if self.provider in ("openai", "openrouter", "groq", "xai"):
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return resp.choices[0].message.content or ""
+            elif self.provider == "anthropic":
+                # Minimal Anthropics messages call via HTTP
+                sys_prompt = ""
+                converted_msgs = []
+                for m in messages:
+                    role = m.get("role")
+                    content = m.get("content", "")
+                    if role == "system":
+                        sys_prompt += content + "\n"
+                    elif role in ("user", "assistant"):
+                        converted_msgs.append({"role": role, "content": content})
+                headers = {
+                    "x-api-key": self.anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                }
+                body = {
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "messages": converted_msgs if converted_msgs else [{"role": "user", "content": "Hello"}],
+                }
+                if sys_prompt.strip():
+                    body["system"] = sys_prompt.strip()
+                r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=60)
+                r.raise_for_status()
+                data = r.json()
+                parts = data.get("content", [])
+                text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+                return text
+            else:
+                raise RuntimeError("Unsupported provider for chat")
+        except Exception as e:
+            raise RuntimeError(f"LLM chat error: {e}") from e
 
 # --------------------------
 # Conversational Orchestrator
@@ -342,7 +590,7 @@ Return JSON with keys:
 - project_slug (kebab-case)
 - description (string)
 - agents (list of {name, role, responsibilities})
-- state_schema (dict of state_field_name -> shortTypeLike 'str'|'list[str]'|'dict'|'int')
+- state_schema (dict of state_field_name -> 'str'|'list[str]'|'dict'|'int')
 - steps (list of step names in execution order)
 - dependencies (list of python packages for the GENERATED project)
 - tasks_by_agent (dict agentName -> list of task bullet points)
@@ -352,7 +600,6 @@ Return JSON with keys:
 FOLLOWUP_QUESTION_PROMPT = """You are an AI product manager. Generate up to 5 short clarifying questions (JSON list of strings) based on the user's goal and any file summaries. Focus on purpose, data, constraints, outputs, and budget/performance needs.
 Return JSON ONLY as an array of strings.
 """
-
 
 def ask_followups(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> List[str]:
     msgs = [
@@ -370,7 +617,6 @@ def ask_followups(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> 
             return [str(q) for q in qs][:5]
     except Exception:
         pass
-    # fallback
     return [
         "Who are the primary users?",
         "What data sources or files should the system use?",
@@ -379,33 +625,24 @@ def ask_followups(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> 
         "How will success be measured?"
     ]
 
-
 def generate_plan(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> PlanSpec:
     msgs = [
         {"role": "system", "content": SYSTEM_PLANNER},
         {"role": "user", "content": json.dumps(spec.model_dump(), indent=2)}
     ]
     raw = router.chat(msgs, model=models.reasoner, temperature=0.2, max_tokens=2500)
-    # Expecting JSON
     try:
         data = json.loads(raw)
     except Exception as e:
         raise RuntimeError(f"Failed to parse plan JSON from LLM: {e}\nRaw:\n{raw}") from e
 
-    # Minimal validation and defaulting
     if "project_slug" not in data:
         data["project_slug"] = slugify(data.get("project_name", "project"))
-    if "dependencies" not in data or not isinstance(data["dependencies"], list):
-        data["dependencies"] = []
-    if "agents" not in data or not isinstance(data["agents"], list):
-        data["agents"] = [{"name": "Planner", "role": "Planner", "responsibilities": ["Plan the work"]}]
-    if "state_schema" not in data or not isinstance(data["state_schema"], dict):
-        data["state_schema"] = {"input": "str", "final_answer": "str"}
-    if "steps" not in data or not isinstance(data["steps"], list):
-        data["steps"] = ["plan", "work", "synthesize"]
-
+    data.setdefault("dependencies", [])
+    data.setdefault("agents", [{"name": "Planner", "role": "Planner", "responsibilities": ["Plan the work"]}])
+    data.setdefault("state_schema", {"input": "str", "final_answer": "str"})
+    data.setdefault("steps", ["plan", "work", "synthesize"])
     return PlanSpec(**data)
-
 
 # --------------------------
 # File Analysis
@@ -424,34 +661,23 @@ def analyze_files(file_paths: List[str]) -> List[FileSummary]:
             continue
 
         ext = pathlib.Path(p).suffix.lower()
-        summary = ""
-        kind = "unknown"
-
         if ext in [".txt", ".md", ".log"]:
-            summary = read_text_file(p)
-            kind = "text"
-        elif ext in [".pdf"]:
-            summary = summarize_pdf(p)
-            kind = "pdf"
-        elif ext in [".csv"]:
-            summary = summarize_csv(p)
-            kind = "csv"
+            summary, kind = read_text_file(p), "text"
+        elif ext == ".pdf":
+            summary, kind = summarize_pdf(p), "pdf"
+        elif ext == ".csv":
+            summary, kind = summarize_csv(p), "csv"
         elif ext in [".xlsx", ".xls"]:
-            summary = summarize_xlsx(p)
-            kind = "xlsx"
-        elif ext in [".json"]:
-            summary = summarize_json(p)
-            kind = "json"
+            summary, kind = summarize_xlsx(p), "xlsx"
+        elif ext == ".json":
+            summary, kind = summarize_json(p), "json"
         else:
-            kind = f"binary({ext})"
-            summary = f"[Binary or unsupported file type: {ext}. Will reference metadata only.]"
-
+            summary, kind = f"[Binary or unsupported file type: {ext}. Metadata only.]", f"binary({ext})"
         results.append(FileSummary(path=p, kind=kind, bytes=st.st_size, summary=summary))
     return results
 
-
 # --------------------------
-# Project Generation Templates
+# Generation Templates (unchanged from your version, trimmed for brevity)
 # --------------------------
 
 TEMPLATE_REQUIREMENTS = """\
@@ -465,44 +691,33 @@ pydantic>=2.9.2
 """
 
 TEMPLATE_ENV_EXAMPLE = """\
-# One of the following is required:
 OPENAI_API_KEY=
-# or
 OPENROUTER_API_KEY=
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 """
 
 TEMPLATE_DOCKERFILE = """\
 FROM python:3.11-slim
-
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-
 RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-
 COPY . /app
-
 CMD ["python", "src/run.py", "Hello from Docker!"]
 """
 
 TEMPLATE_MAKEFILE = """\
 .PHONY: setup test run fmt
-
 setup:
-\tpython -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
-
+python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 test:
-\tpytest -q
-
+pytest -q
 run:
-\tpython src/run.py "Test the app end-to-end"
-
+python src/run.py "Test the app end-to-end"
 fmt:
-\truff check --fix || true
+ruff check --fix || true
 """
 
 TEMPLATE_README = """\
@@ -556,12 +771,13 @@ python src/run.py "Write an outline for the topic: renewable energy trends"
 - Agents are modular; add new ones or tools under `src/agents` and `src/tools`.
 """
 
+# Updated to load model_selection.json and base_url when provider=openrouter
 TEMPLATE_LLM_ROUTER = """\
 import os
+import json
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
-# OpenAI-compatible client
 try:
     from openai import OpenAI
 except Exception:
@@ -569,38 +785,48 @@ except Exception:
 
 load_dotenv()
 
+def _load_model_config():
+    try:
+        with open("model_selection.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
 class LLMRouter:
     def __init__(self, preferred_reasoner: Optional[str] = None, preferred_general: Optional[str] = None, preferred_vision: Optional[str] = None):
+        cfg = _load_model_config()
+        provider_from_cfg = cfg.get("provider")
         self.openai_key = os.environ.get("OPENAI_API_KEY")
         self.openrouter_key = os.environ.get("OPENROUTER_API_KEY")
         self.openrouter_base = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        self.provider = self._detect_provider()
-        if self.provider == "none":
-            raise RuntimeError("Set OPENAI_API_KEY or OPENROUTER_API_KEY in environment.")
-        self.client = self._make_client()
-        self.reasoner = preferred_reasoner
-        self.general = preferred_general
-        self.vision = preferred_vision
 
-    def _detect_provider(self) -> str:
-        if self.openrouter_key:
-            return "openrouter"
-        if self.openai_key:
-            return "openai"
-        return "none"
+        # Decide provider: if cfg says openrouter and key exists, use it; else OpenAI
+        if provider_from_cfg == "openrouter" and self.openrouter_key:
+            self.provider = "openrouter"
+        elif self.openai_key:
+            self.provider = "openai"
+        elif self.openrouter_key:
+            self.provider = "openrouter"
+        else:
+            raise RuntimeError("Set OPENAI_API_KEY or OPENROUTER_API_KEY")
 
-    def _make_client(self):
         if OpenAI is None:
             raise RuntimeError("openai package required")
+
         if self.provider == "openai":
-            return OpenAI(api_key=self.openai_key)
+            self.client = OpenAI(api_key=self.openai_key)
         else:
-            return OpenAI(api_key=self.openrouter_key, base_url=f"{self.openrouter_base}")
+            self.client = OpenAI(api_key=self.openrouter_key, base_url=f"{self.openrouter_base}")
+
+        # Model prefs: config -> args -> fallback
+        self.reasoner = preferred_reasoner or cfg.get("reasoner")
+        self.general  = preferred_general  or cfg.get("general")
+        self.vision   = preferred_vision   or cfg.get("vision")
 
     def chat(self, messages: List[Dict[str, Any]], model: Optional[str] = None, temperature: float = 0.2, max_tokens: int = 1500) -> str:
         model_to_use = model or self.general or self.reasoner
         if not model_to_use:
-            model_to_use = "gpt-4o" if self.provider == "openai" else "openrouter/auto"
+            model_to_use = "gpt-4o" if self.provider == "openai" else "openai/gpt-4o"
         resp = self.client.chat.completions.create(
             model=model_to_use,
             messages=messages,
@@ -644,7 +870,6 @@ def build_graph(router: LLMRouter):
 
 TEMPLATE_RUN = """\
 import sys
-import os
 from dotenv import load_dotenv
 from .llm_router import LLMRouter
 from .graph import build_graph
@@ -654,7 +879,7 @@ load_dotenv()
 def main():
     if len(sys.argv) < 2:
         print("Usage: python src/run.py \"Your task prompt\"")
-        sys.exit(1)
+        raise SystemExit(1)
     user_input = sys.argv[1]
     router = LLMRouter()
     app = build_graph(router)
@@ -676,7 +901,6 @@ if __name__ == "__main__":
 """
 
 TEMPLATE_AGENT_PLANNER = """\
-from typing import List, Dict, Any
 def planner_node(router, state):
     messages = [
         {"role": "system", "content": "You are a senior planner. Break the task into 3-6 concrete steps."},
@@ -691,7 +915,6 @@ def planner_node(router, state):
 """
 
 TEMPLATE_AGENT_RESEARCHER = """\
-from typing import List, Dict, Any
 from ..tools.search import ddg_search
 from ..tools.web import fetch_and_summarize
 
@@ -712,7 +935,6 @@ def researcher_node(router, state):
 
 TEMPLATE_AGENT_CODER = """\
 def coder_node(router, state):
-    # If user wants code, generate snippets; otherwise create structured bullet points.
     messages = [
         {"role": "system", "content": "You write minimal, correct code snippets or structured solutions as requested."},
         {"role": "user", "content": f"Task: {state['input']}\nResearch:\n{state.get('research_notes','')[:4000]}\nCreate concise code snippets if relevant."}
@@ -734,8 +956,6 @@ def synthesizer_node(router, state):
 """
 
 TEMPLATE_TOOL_FILES = """\
-import os
-
 def read_text(path: str, limit: int = 20000) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -752,7 +972,6 @@ def ddg_search(query: str, max_results: int = 3):
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
-            # Normalize
             normalized = []
             for r in results:
                 normalized.append({
@@ -761,7 +980,7 @@ def ddg_search(query: str, max_results: int = 3):
                     "snippet": r.get("body")
                 })
             return normalized
-    except Exception as e:
+    except Exception:
         return []
 """
 
@@ -772,7 +991,6 @@ def fetch_and_summarize(url: str) -> str:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
         text = r.text
-        # naive summarization: take first ~800 chars
         return text[:800] + ("..." if len(text) > 800 else "")
     except Exception as e:
         return f"[Error fetching {url}: {e}]"
@@ -786,7 +1004,6 @@ def test_import():
     assert hasattr(r, "LLMRouter")
 """
 
-
 # --------------------------
 # Project Generator
 # --------------------------
@@ -798,52 +1015,36 @@ class ProjectGenerator:
         self.models = models
 
     def generate(self) -> None:
-        # Layout
         ensure_dir(self.out_dir)
-        ensure_dir(os.path.join(self.out_dir, "src"))
         ensure_dir(os.path.join(self.out_dir, "src", "agents"))
         ensure_dir(os.path.join(self.out_dir, "src", "tools"))
         ensure_dir(os.path.join(self.out_dir, "tests"))
 
-        # Core files
         self._write("requirements.txt", TEMPLATE_REQUIREMENTS)
         self._write(".env.example", TEMPLATE_ENV_EXAMPLE)
         self._write("Dockerfile", TEMPLATE_DOCKERFILE)
         self._write("Makefile", TEMPLATE_MAKEFILE)
 
-        # README (rendered with plan)
-        readme = Template(TEMPLATE_README).render(
-            project_name=self.plan.project_name,
-            description=self.plan.description
-        )
+        readme = Template(TEMPLATE_README).render(project_name=self.plan.project_name, description=self.plan.description)
         self._write("README.md", readme)
 
-        # src
         self._write("src/llm_router.py", TEMPLATE_LLM_ROUTER)
         self._write("src/graph.py", TEMPLATE_GRAPH)
         self._write("src/run.py", TEMPLATE_RUN)
 
-        # agents
         self._write("src/agents/planner.py", TEMPLATE_AGENT_PLANNER)
         self._write("src/agents/researcher.py", TEMPLATE_AGENT_RESEARCHER)
         self._write("src/agents/coder.py", TEMPLATE_AGENT_CODER)
         self._write("src/agents/synthesizer.py", TEMPLATE_AGENT_SYNTHESIZER)
 
-        # tools
         self._write("src/tools/files.py", TEMPLATE_TOOL_FILES)
         self._write("src/tools/search.py", TEMPLATE_TOOL_SEARCH)
         self._write("src/tools/web.py", TEMPLATE_TOOL_WEB)
 
-        # tests
         self._write("tests/test_smoke.py", TEMPLATE_TEST_SMOKE)
 
-        # pin chosen models into a simple config file for the app (optional)
-        model_config = {
-            "provider": self.models.provider,
-            "reasoner": self.models.reasoner,
-            "general": self.models.general,
-            "vision": self.models.vision
-        }
+        # Persist chosen models for the generated app
+        model_config = {"provider": self.models.provider, "reasoner": self.models.reasoner, "general": self.models.general, "vision": self.models.vision}
         self._write("model_selection.json", json.dumps(model_config, indent=2))
 
     def _write(self, rel: str, content: str) -> None:
@@ -852,9 +1053,8 @@ class ProjectGenerator:
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
-
 # --------------------------
-# Creator CLI
+# CLI Flow
 # --------------------------
 
 def save_history(entry: Dict[str, Any], path: str = "creator_history.json") -> None:
@@ -869,6 +1069,40 @@ def save_history(entry: Dict[str, Any], path: str = "creator_history.json") -> N
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
+def _render_responsibilities(v: Any) -> str:
+    if isinstance(v, list):
+        return "; ".join(str(x) for x in v)
+    if isinstance(v, str):
+        return v
+    return str(v)
+
+def interactive_model_choice(role: str, ranked: List[ModelInfo], default_model_id: str) -> str:
+    table = Table(title=f"Top candidates for {role}", box=box.MINIMAL)
+    table.add_column("#", justify="right")
+    table.add_column("Model ID")
+    table.add_column("Provider")
+    table.add_column("Vendor")
+    table.add_column("Prompt $")
+    table.add_column("Completion $")
+    table.add_column("Context")
+    top = ranked[:8]
+    for i, m in enumerate(top, 1):
+        table.add_row(
+            str(i),
+            m.model_id,
+            m.provider,
+            m.vendor or "-",
+            f"{m.price_prompt:.6f}" if m.price_prompt is not None else "-",
+            f"{m.price_completion:.6f}" if m.price_completion is not None else "-",
+            str(m.context or "-")
+        )
+    console.print(table)
+    choice = Prompt.ask(f"Choose {role} model [1-{len(top)}] or press Enter to accept default", default="")
+    if choice.strip().isdigit():
+        idx = int(choice.strip())
+        if 1 <= idx <= len(top):
+            return top[idx - 1].model_id
+    return default_model_id
 
 def main():
     load_dotenv()
@@ -877,25 +1111,33 @@ def main():
     parser.add_argument("--files", type=str, default="", help="Comma-separated file paths")
     parser.add_argument("--out-dir", type=str, default="out", help="Output directory")
     parser.add_argument("--yes", action="store_true", help="Non-interactive; skip follow-ups")
+    parser.add_argument("--auto-models", action="store_true", help="Skip interactive model choice; accept defaults")
+    parser.add_argument("--quality", type=str, choices=["best", "balanced", "budget"], default="balanced", help="Model selection preference")
     args = parser.parse_args()
 
     console.print(Panel.fit("[bold cyan]LangGraph Creator Pro[/bold cyan]\nBuild intelligent multi-agent systems with zero code.", box=box.ROUNDED))
 
-    # LLM routing
+    # Router (with quality preference)
     try:
-        router = LLMRouter()
+        router = LLMRouter(quality=args.quality)
     except Exception as e:
-        console.print(f"[red]Error initializing LLM provider: {e}[/red]")
+        console.print(f"[red]Error initializing providers: {e}[/red]")
         sys.exit(1)
 
     # Discover models
-    console.print("[bold]Discovering available models...[/bold]")
+    console.print("[bold]Discovering available models (live)...[/bold]")
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
-        t = progress.add_task("Querying providers", total=None)
+        progress.add_task("Querying providers", total=None)
         discovered = router.discover_models()
-        selected = router.pick_models(discovered)
-        progress.remove_task(t)
 
+    # Rank and pick
+    reasoner_ranked = router._rank_for_role(discovered, "reasoner")
+    general_ranked  = router._rank_for_role(discovered, "general")
+    vision_ranked   = router._rank_for_role(discovered, "vision")
+
+    selected = router.pick_models(discovered)
+
+    # Display selections
     table = Table(title="Selected Models", box=box.MINIMAL)
     table.add_column("Role")
     table.add_column("Model ID")
@@ -904,6 +1146,14 @@ def main():
     table.add_row("General", selected.general, selected.provider)
     table.add_row("Vision", selected.vision or "-", selected.provider)
     console.print(table)
+
+    # Interactive choice if not auto
+    if not args.auto_models:
+        if Confirm.ask("Would you like to choose different models?", default=False):
+            selected.reasoner = interactive_model_choice("reasoner", reasoner_ranked, selected.reasoner)
+            selected.general  = interactive_model_choice("general", general_ranked, selected.general)
+            if vision_ranked:
+                selected.vision = interactive_model_choice("vision", vision_ranked, selected.vision or vision_ranked[0].model_id)
 
     # Files
     files = [p.strip() for p in args.files.split(",")] if args.files else []
@@ -923,11 +1173,8 @@ def main():
             ft.add_row(fs.path, fs.kind, str(fs.bytes))
         console.print(ft)
 
-    # Compose user spec
-    spec = UserSpec(
-        goal=args.goal,
-        file_summaries=[fs.__dict__ for fs in file_summaries]
-    )
+    # Compose spec
+    spec = UserSpec(goal=args.goal, file_summaries=[fs.__dict__ for fs in file_summaries])
 
     # Follow-ups
     if not args.yes:
@@ -946,7 +1193,7 @@ def main():
         progress.add_task("Reasoning and planning", total=None)
         plan = generate_plan(router, selected, spec)
 
-    # Preview
+    # Preview (with fixed responsibilities rendering)
     console.print(Panel.fit(f"[bold]Project:[/bold] {plan.project_name}\n[bold]Slug:[/bold] {plan.project_slug}\n[bold]Description:[/bold] {plan.description}", title="Plan Preview"))
 
     at = Table(title="Agents", box=box.SIMPLE)
@@ -954,7 +1201,8 @@ def main():
     at.add_column("Role")
     at.add_column("Responsibilities", overflow="fold")
     for a in plan.agents:
-        at.add_row(a.get("name", "?"), a.get("role", "?"), ", ".join(a.get("responsibilities", [])))
+        resp = _render_responsibilities(a.get("responsibilities", []))
+        at.add_row(a.get("name", "?"), a.get("role", "?"), resp)
     console.print(at)
 
     st = Table(title="State Schema", box=box.SIMPLE)
@@ -996,9 +1244,8 @@ def main():
         "details": spec.details,
         "files": files,
         "chosen_models": selected.model_dump(),
-        "plan": plan.model_dump(),
+        "provider": router.provider
     })
-
 
 if __name__ == "__main__":
     main()
