@@ -103,6 +103,139 @@ TRUSTED_VENDORS = {
 # Exclude non-chat/specialized models; also filter noisy "search" previews
 EXCLUDE_KEYWORDS = ["embedding", "embed", "tts", "whisper", "speech", "audio", "asr", "voice", "search"]
 
+STOPWORDS = {
+    "what","how","should","the","is","are","to","a","an","of","for","in","on","after","do","does",
+    "and","or","be","it","this","that","system","you","we","user","users","with","from","by","as",
+    "about","there","any","need","needs","specific","requirements","expected","format","structure"
+}
+
+def _token_set(s: str) -> set:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    toks = [t for t in s.split() if t and t not in STOPWORDS]
+    return set(toks)
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+def _is_duplicate_question(q: str, asked_sets: List[set], threshold: float = 0.7) -> bool:
+    ts = _token_set(q)
+    for prev in asked_sets:
+        if _jaccard(ts, prev) >= threshold:
+            return True
+    return False
+
+def _strip_redundant_questions(qs: List[str], asked_sets: List[set]) -> List[str]:
+    out = []
+    seen_sets = []
+    for q in qs:
+        if not q or not q.strip():
+            continue
+        ts = _token_set(q)
+        if _is_duplicate_question(q, asked_sets) or _is_duplicate_question(q, seen_sets):
+            continue
+        out.append(q)
+        seen_sets.append(ts)
+    return out
+
+def _extract_first_json(text: str) -> Optional[Any]:
+    if not text:
+        return None
+    # Prefer fenced code or braces (we already have extract_json_block)
+    block = extract_json_block(text) or text
+    # Try array first
+    start_arr, end_arr = block.find("["), block.rfind("]")
+    if 0 <= start_arr < end_arr:
+        try:
+            return json.loads(block[start_arr:end_arr+1])
+        except Exception:
+            pass
+    # Try object
+    start_obj, end_obj = block.find("{"), block.rfind("}")
+    if 0 <= start_obj < end_obj:
+        try:
+            return json.loads(block[start_obj:end_obj+1])
+        except Exception:
+            pass
+    return None
+
+def _infer_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, list):
+        # Try homogeneous list[str]
+        if all(isinstance(x, str) for x in value):
+            return "list[str]"
+        if all(isinstance(x, dict) for x in value):
+            return "list[dict]"
+        return "list[Any]"
+    if isinstance(value, dict):
+        return "dict"
+    return "Any"
+
+def _infer_schema_from_incidents(incidents: List[Dict[str, Any]]) -> Dict[str, str]:
+    schema: Dict[str, str] = {}
+    for item in incidents:
+        if not isinstance(item, dict):
+            continue
+        for k, v in item.items():
+            t = _infer_type(v)
+            # prefer more specific list[str] over list[Any], etc.
+            prev = schema.get(k)
+            if prev is None or (prev == "list[Any]" and t.startswith("list[")) or prev == "Any":
+                schema[k] = t
+            else:
+                # if conflicting, fallback to Any
+                if prev != t:
+                    schema[k] = "Any"
+    return schema
+
+def _enrich_spec_from_answers(spec: "UserSpec") -> None:
+    # Look through user-provided answers to harvest sample JSON and infer schema
+    sample_texts = []
+    for k, v in spec.details.items():
+        if isinstance(v, str) and ("[" in v or "{" in v):
+            sample_texts.append(v)
+    if not sample_texts and spec.file_summaries:
+        # also check file summaries if any
+        for fs in spec.file_summaries:
+            s = fs.get("summary")
+            if isinstance(s, str) and ("[" in s or "{" in s):
+                sample_texts.append(s)
+
+    incidents = None
+    for st in sample_texts:
+        data = _extract_first_json(st)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            incidents = data
+            break
+        if isinstance(data, dict):
+            # check for "incidents" key
+            arr = data.get("incidents")
+            if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                incidents = arr
+                break
+    if incidents:
+        spec.details["incident_schema_inferred"] = _infer_schema_from_incidents(incidents)
+
+def _delegation_score(details: Dict[str, Any]) -> int:
+    text = " ".join([str(v).lower() for v in details.values() if isinstance(v, str)])
+    cues = [
+        "leave that to you", "leave it to you", "you decide", "decide", "not applicable",
+        "up to you", "whatever is needed", "i leave that to you", "i leave it to you"
+    ]
+    return sum(1 for c in cues if c in text)
+
 def slugify(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9\- ]+", "", name).strip().lower().replace(" ", "-")
     s = re.sub(r"-{2,}", "-", s)
@@ -583,7 +716,8 @@ class LLMRouter:
 
 SYSTEM_PLANNER = """You are an expert AI systems architect specializing in LangGraph multi-agent systems.
 - Conduct a brief, focused discovery to clarify ambiguous goals.
-- Incorporate provided file summaries.
+- Incorporate provided file summaries and any inferred schemas or assumptions under details.
+- Honor 'details.assumptions' if present (rules, integrations, notifications, failure policy, idempotency).
 - Design a practical, production-ready multi-agent architecture.
 - Choose cost-effective model roles (reasoning vs general).
 - Output a JSON plan ONLY, following the schema strictly.
@@ -598,10 +732,6 @@ Return JSON with keys:
 - dependencies (list of python packages for the GENERATED project)
 - tasks_by_agent (dict agentName -> list of task bullet points)
 - notes (optional)
-"""
-
-FOLLOWUP_QUESTION_PROMPT = """You are an AI product manager. Generate up to 5 short clarifying questions (JSON list of strings) based on the user's goal and any file summaries. Focus on purpose, data, constraints, outputs, and budget/performance needs.
-Return JSON ONLY as an array of strings.
 """
 
 ASSESS_REQUIREMENTS_PROMPT = """You are an AI analyst. Assess if the current requirements are sufficient to generate a production-ready system.
@@ -621,30 +751,86 @@ Return JSON ONLY with:
 }
 """
 
-def ask_followups(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> List[str]:
+def ask_followups(router: "LLMRouter", models: "SelectedModels", spec: "UserSpec", asked_sets: List[set], ask_style: str) -> List[str]:
+    # If delegation is high or ask_style is minimal, keep questions <= 2 or skip
+    delegation = _delegation_score(spec.details)
+    max_q = 0 if ask_style == "minimal" or delegation >= 2 else (2 if ask_style == "auto" else (4 if ask_style == "balanced" else 5))
+
+    # If we already inferred schema, avoid structure questions
+    avoid_hints = []
+    if "incident_schema_inferred" in spec.details:
+        avoid_hints.append("schema")
+        avoid_hints.append("structure")
+        avoid_hints.append("format")
+
     msgs = [
-        {"role": "system", "content": "You generate clarifying questions only as JSON."},
+        {"role": "system", "content": "You generate at most N short clarifying questions as pure JSON array of strings. Avoid redundancy. If enough info exists or the user is delegating decisions, return an empty array."},
         {"role": "user", "content": json.dumps({
             "goal": spec.goal,
+            "details": spec.details,
             "file_summaries": spec.file_summaries,
-            "instruction": FOLLOWUP_QUESTION_PROMPT
+            "max_questions": max_q,
+            "avoid_topics_hints": avoid_hints
         })}
     ]
     try:
-        qs = router.chat_json(msgs, model=models.general, temperature=0.2, max_tokens=700)
+        qs = router.chat_json(msgs, model=models.general, temperature=0.1, max_tokens=500)
         if isinstance(qs, list):
-            return [str(q) for q in qs][:5]
-        if isinstance(qs, dict) and "questions" in qs and isinstance(qs["questions"], list):
-            return [str(q) for q in qs["questions"]][:5]
+            filtered = _strip_redundant_questions([str(q) for q in qs][:max_q], asked_sets)
+            return filtered
     except Exception:
         pass
-    return [
-        "Who are the primary users?",
-        "What data sources or files should the system use?",
-        "What are the desired outputs and format?",
-        "Any constraints (budget, latency, compliance)?",
-        "How will success be measured?"
+    return []
+
+ASSUMPTIONS_PROMPT = """You are a pragmatic SOC architect. Given the user's goal and any provided details (including inferred incident schema),
+propose a production-ready default plan as strict JSON ONLY with keys:
+{
+  "rules_engine": {
+    "strategy": "playbooks|playbooks+ml",
+    "playbooks": [
+      {"match": "vector contains 'phishing' or 'zero-day'", "actions": ["contain_endpoints", "block_iocs", "notify", "ticket"]},
+      {"match": "vector contains 'DDoS' or 'traffic spike'", "actions": ["tune_alerts", "update_whitelist", "notify", "ticket"]}
     ]
+  },
+  "integrations": {
+    "splunk": {"queries": ["search index=* ..."], "auth": "env:SPLUNK_*"},
+    "servicenow": {"table": "incident", "fields": {"short_description": "name", "description": "description", "severity": "auto"}, "auth": "env:SN_*"},
+    "smtp": {"subject_template": "[SOC] {{name}}", "body_template": "Incident {{name}} on {{date}} ...", "auth": "env:SMTP_*"},
+    "ldap": {"group_lookup": "CN=SOC,OU=Groups,DC=example,DC=com", "auth": "env:LDAP_*"}
+  },
+  "failure_policy": {"retry": {"retries": 3, "backoff": "exponential", "initial_seconds": 2}, "log": "structured", "escalate": "email:secops@example.com"},
+  "idempotency": {"key": "sha256(name + date)", "store": "local-json"},
+  "security": {"audit_log": "jsonl", "pii_handling": "mask-in-notifications", "least_privilege": true}
+}
+Keep it concise and realistic. Do not output markdown or commentary.
+"""
+
+def propose_assumptions(router: "LLMRouter", models: "SelectedModels", spec: "UserSpec") -> Dict[str, Any]:
+    msgs = [
+        {"role": "system", "content": ASSUMPTIONS_PROMPT},
+        {"role": "user", "content": json.dumps(spec.model_dump(), indent=2)}
+    ]
+    try:
+        data = router.chat_json(msgs, model=models.reasoner, temperature=0.2, max_tokens=1200)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    # Fallback minimal defaults
+    return {
+        "rules_engine": {"strategy": "playbooks", "playbooks": [{"match": "always", "actions": ["notify", "ticket"]}]},
+        "integrations": {"splunk": {}, "servicenow": {"table": "incident"}, "smtp": {}, "ldap": {}},
+        "failure_policy": {"retry": {"retries": 3, "backoff": "exponential", "initial_seconds": 2}, "log": "structured"},
+        "idempotency": {"key": "sha256(name+date)", "store": "local-json"},
+        "security": {"audit_log": "jsonl"}
+    }
+
+def _present_assumptions_summary(data: Dict[str, Any]) -> str:
+    # Compact text summary for console
+    try:
+        return json.dumps(data, indent=2)
+    except Exception:
+        return str(data)
 
 def assess_requirements(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> Dict[str, Any]:
     msgs = [
@@ -666,42 +852,75 @@ def detect_conflicts(router: LLMRouter, models: SelectedModels, spec: UserSpec) 
     except Exception:
         return {"conflicts": [], "suggestions": []}
 
-def clarification_loop(router: LLMRouter, models: SelectedModels, spec: UserSpec, max_rounds: int = 3) -> UserSpec:
-    """Iteratively ask follow-ups until satisfied or until max rounds."""
+def clarification_loop(router: "LLMRouter", models: "SelectedModels", spec: "UserSpec", max_rounds: int = 3, ask_style: str = "auto") -> "UserSpec":
+    asked_sets: List[set] = []
+    # Pre-enrich from any user-provided samples
+    _enrich_spec_from_answers(spec)
+
     for round_idx in range(max_rounds):
-        questions = ask_followups(router, models, spec)
+        # Delegation-aware fast path: if user is delegating or style is minimal, jump to assumptions proposal
+        if ask_style == "minimal" or _delegation_score(spec.details) >= 2:
+            assumptions = propose_assumptions(router, models, spec)
+            console.print(Panel.fit(_present_assumptions_summary(assumptions), title="Assumptions Summary (auto-proposed)", style="cyan"))
+            if confirm_yn("Approve these defaults and proceed?", default=True):
+                spec.details["assumptions"] = assumptions
+                return spec
+            else:
+                # Allow a single inline JSON tweak
+                edit = Prompt.ask("Paste JSON overrides for assumptions (or press Enter to skip):", default="")
+                if edit.strip():
+                    try:
+                        overrides = json.loads(edit)
+                        if isinstance(overrides, dict):
+                            assumptions.update(overrides)
+                    except Exception:
+                        console.print("[yellow]Invalid JSON; keeping original assumptions.[/yellow]")
+                spec.details["assumptions"] = assumptions
+                return spec
+
+        questions = ask_followups(router, models, spec, asked_sets, ask_style)
         if not questions:
-            break
+            # Not asking anything else; propose assumptions anyway for a single confirmation
+            assumptions = propose_assumptions(router, models, spec)
+            console.print(Panel.fit(_present_assumptions_summary(assumptions), title="Assumptions Summary (auto-proposed)", style="cyan"))
+            if confirm_yn("Approve these defaults and proceed?", default=True):
+                spec.details["assumptions"] = assumptions
+                return spec
+            spec.details["assumptions"] = assumptions
+            return spec
+
         console.print(f"[bold]Clarification round {round_idx+1}[/bold]")
         for q in questions:
             ans = Prompt.ask(f"[green]?[/green] {q}", default="")
             if ans.strip():
                 spec.details[q] = ans.strip()
+        asked_sets.extend([_token_set(q) for q in questions])
 
-        # Check conflicts
+        # Detect conflicts once per round
         review = detect_conflicts(router, models, spec)
         conflicts = review.get("conflicts") or []
         if conflicts:
             console.print(Panel.fit("\n".join(conflicts), title="Potential Conflicts Detected", style="yellow"))
-            if confirm_yn("Would you like to add clarifications to resolve these?", default=True):
+            if confirm_yn("Add clarifications to resolve these?", default=True):
                 for conf in conflicts:
                     add = Prompt.ask(f"Resolution/clarification for: {conf}", default="")
                     if add.strip():
-                        # Record under a special key so planner can see resolutions
                         spec.details.setdefault("conflict_resolutions", []).append({"conflict": conf, "resolution": add.strip()})
 
-        # Assess completeness
+        # If satisfied, finalize by proposing assumptions once
         assessment = assess_requirements(router, models, spec)
         if bool(assessment.get("satisfied", False)):
-            break
-        followups = assessment.get("followups") or []
-        if not followups:
-            break
-        console.print("[bold]Additional follow-ups needed:[/bold]")
-        for q in followups:
-            ans = Prompt.ask(f"[green]?[/green] {q}", default="")
-            if ans.strip():
-                spec.details[q] = ans.strip()
+            assumptions = propose_assumptions(router, models, spec)
+            console.print(Panel.fit(_present_assumptions_summary(assumptions), title="Assumptions Summary (auto-proposed)", style="cyan"))
+            if confirm_yn("Approve these defaults and proceed?", default=True):
+                spec.details["assumptions"] = assumptions
+                return spec
+            spec.details["assumptions"] = assumptions
+            return spec
+
+    # After max rounds, proceed with assumptions anyway
+    assumptions = propose_assumptions(router, models, spec)
+    spec.details["assumptions"] = assumptions
     return spec
 
 def generate_plan(router: LLMRouter, models: SelectedModels, spec: UserSpec) -> PlanSpec:
@@ -1215,6 +1434,7 @@ def main():
     parser.add_argument("--auto-models", action="store_true", help="Skip interactive model choice; accept defaults")
     parser.add_argument("--quality", type=str, choices=["best", "balanced", "budget"], default="balanced", help="Model selection preference")
     parser.add_argument("--max-clarify-rounds", type=int, default=3, help="Max clarification rounds before planning")
+    parser.add_argument("--ask-style", type=str, choices=["auto", "minimal", "balanced", "exhaustive"], default="auto", help="How many clarifying questions to ask")
     args = parser.parse_args()
 
     console.print(Panel.fit("[bold cyan]LangGraph Creator Pro[/bold cyan]\nBuild intelligent multi-agent systems with zero code.", box=box.ROUNDED))
@@ -1281,7 +1501,7 @@ def main():
     # Clarifications loop (unless --yes)
     if not args.yes:
         console.print("[bold]A few quick questions to tailor the system...[/bold]")
-        spec = clarification_loop(router, selected, spec, max_rounds=args.max_clarify_rounds)
+        spec = clarification_loop(router, selected, spec, max_rounds=args.max_clarify_rounds, ask_style=args.ask_style)
 
     # Generate plan
     console.print("[bold]Designing your multi-agent architecture...[/bold]")
